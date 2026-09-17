@@ -47,6 +47,17 @@ When enabled in settings, the plugin runs a background loop:
 
 The engine's protocol is symmetric: `handlePeerSession(transport, store)` runs the peer side (file-list, begin, sync, done frames — see `src/sync/SyncEngine.ts`). A relay server that keeps doc copies implements exactly that against a WebSocket; two plugin instances talking directly also work, which is what the test suite simulates (`tests/syncEngine.test.ts`: loopback transports, two in-memory vaults, converge + bidirectional + no-op second round + error-state cases).
 
+### Relay hub (recommended)
+
+`relay.mjs` is a **hub**: it stores documents in memory and runs the peer side of the protocol (`handlePeerSession`) for every connection. Vaults can connect independently — no pairing, no need to be online simultaneously.
+
+```sh
+npm run build:relay        # bundle relay.mjs (or: node scripts/build-relay.mjs)
+node relay.mjs 8080        # → "Automerge relay hub listening on ws://0.0.0.0:8080"
+```
+
+Point **every vault's** Server URL at `ws://localhost:8080`. Each vault syncs with the hub on its own interval; the hub merges everything (CRDT) and serves the merged state to the others. The hub's store is in-memory; run it persistently for a long-lived sync point.
+
 ## Development
 
 Requires Node ≥ 20. Note: if your shell sets `NODE_ENV=production`, npm skips devDependencies — use `env -u NODE_ENV npm install --include=dev` or unset it.

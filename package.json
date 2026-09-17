@@ -7,6 +7,7 @@
   "scripts": {
     "dev": "node esbuild.config.mjs --watch",
     "build": "tsc --noEmit && node esbuild.config.mjs production && node tests/smoke.test.mjs",
+    "build:relay": "node scripts/build-relay.mjs",
     "test": "vitest run",
     "test:watch": "vitest",
     "check": "npm run test && npm run build"
@@ -20,6 +21,7 @@
   "license": "MIT",
   "devDependencies": {
     "@types/node": "^24.0.0",
+    "@types/ws": "^8.18.1",
     "builtin-modules": "^4.0.0",
     "esbuild": "^0.25.0",
     "jsdom": "^30.1.0",
@@ -29,6 +31,7 @@
     "vitest": "^3.2.0"
   },
   "dependencies": {
-    "@automerge/automerge": "3.4.1"
+    "@automerge/automerge": "3.4.1",
+    "ws": "^8.21.3"
   }
 }
