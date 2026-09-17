@@ -38,7 +38,8 @@ When enabled in settings, the plugin runs a background loop:
 
 - Every note in the vault gets its own Automerge document; encoded copies live under `.automerge-sync/<path>.amrg`.
 - **The vault bridge (`VaultSyncStore` in `src/main.ts`) is what moves note text:** before each sync round it imports the current markdown text into the note's doc (seeded from the file on first sync; mtime-guarded afterwards), and after syncing it writes merged content back to the `.md` — updating existing notes and creating files that only exist on the other side. Changes sync as visible vault edits, not just `.amrg` blobs.
-- On each interval (default 30 s) it connects to the configured WebSocket URL, exchanges file lists, and runs the Automerge sync protocol per file in both directions. Files present on only one side are created on the other; concurrent edits to different fields CRDT-merge.
+- **Deletion & moves are tombstoned:** when a note's `.md` is deleted (or moved — a move is create-new + delete-old), its doc is marked `deleted: true` and that flag propagates through sync like any change. Other vaults honor it by trashing the local file, so deletions sync correctly instead of the note resurrecting.
+- On each interval (default 30 s) it connects to the configured WebSocket URL, exchanges file lists, and runs the Automerge sync protocol per file in both directions. Concurrent edits to different fields CRDT-merge.
 - **Status bar**: bottom-right indicator — `AM: off` (disabled) / `AM: connecting…` / `AM: syncing…` / `AM: ok N files (Xs ago)` / `AM: error` (hover for the message).
 - **Settings tab** (Settings → Automerge Sync): enable toggle, server URL (`ws://…`), interval in seconds.
 

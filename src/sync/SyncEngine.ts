@@ -64,6 +64,8 @@ export interface NotePayload {
 	path: string;
 	content: string;
 	updatedAt: number;
+	/** Tombstone: the note was deleted; propagate so peers remove it too. */
+	deleted?: boolean;
 }
 
 export function encodeNoteDoc(payload: NotePayload): Uint8Array {

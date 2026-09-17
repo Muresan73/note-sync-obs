@@ -24,6 +24,7 @@ export class VaultBinaryStore implements BinaryStore {
 		readBinary: (p: string) => Promise<ArrayBuffer>;
 		writeBinary: (p: string, data: ArrayBuffer) => Promise<void>;
 		mkdir: (p: string) => Promise<void>;
+		list?: (p: string) => Promise<{ files: string[] }>;
 	}) {}
 
 	async exists(path: string): Promise<boolean> {
@@ -59,6 +60,15 @@ export class VaultBinaryStore implements BinaryStore {
 				await this.adapter.mkdir(cur);
 			}
 		}
+	}
+
+	/** List files in a directory (if the adapter supports listing). */
+	async listDir(path: string): Promise<string[]> {
+		if (this.adapter.list) {
+			const res = await this.adapter.list(normalizePath(path));
+			return res.files ?? [];
+		}
+		return [];
 	}
 }
 

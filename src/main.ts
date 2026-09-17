@@ -47,6 +47,7 @@ export class VaultSyncStore implements SyncStore {
 			modify(file: TFile, data: string): Promise<void>;
 			create(path: string, data: string): Promise<TFile>;
 		},
+		private readonly trash: (file: TAbstractFile) => Promise<void>,
 	) {}
 
 	private docPathFor(notePath: string): string {
@@ -56,8 +57,41 @@ export class VaultSyncStore implements SyncStore {
 		return `${DOC_DIR}/${safe}${DOC_EXTENSION}`;
 	}
 
+	// Track notes whose .md file vanished but whose doc still exists — they
+	// get a tombstone doc (deleted flag) so the deletion propagates to other
+	// replicas instead of the file resurrecting on the next sync.
+	private deletedPaths: Set<string> | null = null;
+
+	/**
+	 * Find .amrg docs whose note no longer exists in the vault. The note path
+	 * is read from the doc payload (the flattened filename is lossy).
+	 * Cached per sync round (listFiles is called once per round).
+	 */
+	private async deletedNotes(): Promise<Set<string>> {
+		if (this.deletedPaths) return this.deletedPaths;
+		const deleted = new Set<string>();
+		for (const p of await this.adapter.listDir(DOC_DIR)) {
+			if (!p.endsWith(DOC_EXTENSION)) continue;
+			try {
+				const doc = decodeNoteDoc(await this.adapter.read(p));
+				if (!doc.deleted && !this.vault.getAbstractFileByPath(doc.path)) {
+					deleted.add(doc.path);
+				}
+			} catch {
+				// Unreadable blob — leave it alone.
+			}
+		}
+		this.deletedPaths = deleted;
+		return deleted;
+	}
+
 	async listFiles(): Promise<string[]> {
-		return this.vault.getMarkdownFiles().map((f) => f.path);
+		const deleted = await this.deletedNotes();
+		// Include tombstone candidates so the engine syncs their (marked)
+		// docs to peers, then clear the cache for the next round.
+		const paths = [...this.vault.getMarkdownFiles().map((f) => f.path), ...deleted];
+		this.deletedPaths = null;
+		return paths;
 	}
 
 	async readDoc(notePath: string): Promise<Uint8Array | null> {
@@ -75,11 +109,21 @@ export class VaultSyncStore implements SyncStore {
 					path: notePath,
 					content: text,
 					updatedAt: file.stat.mtime,
+					deleted: false,
 				});
 			}
 			return null;
 		}
 		const bytes = await this.adapter.read(p);
+
+		// Deletion: the .md vanished but the doc still exists — mark it.
+		// The tombstone then propagates to peers through normal sync.
+		if (!file) {
+			return applyEdit(bytes, (d) => {
+				d.deleted = true;
+				d.content = "";
+			});
+		}
 
 		// Import: if the .md file changed since we last stored the doc,
 		// fold the current text into the doc as a new change.
@@ -108,10 +152,16 @@ export class VaultSyncStore implements SyncStore {
 	async writeDoc(notePath: string, bytes: Uint8Array): Promise<void> {
 		await this.adapter.write(this.docPathFor(notePath), bytes);
 
-		// Export: if the merged doc's content differs from the .md on disk,
-		// write it back so sync results are visible in the vault.
+		// Export: honor the tombstone first — a deletion that arrived via sync
+		// removes the local file; content export only applies to live notes.
 		const abstract = this.vault.getAbstractFileByPath(notePath);
 		const doc = decodeNoteDoc(bytes);
+		if (doc.deleted) {
+			if (abstract && "stat" in abstract) {
+				await this.trash(abstract);
+			}
+			return;
+		}
 		if (abstract && "stat" in abstract) {
 			const file = abstract as TFile;
 			const diskText = await this.vault.read(file);
@@ -193,7 +243,9 @@ export default class AutomergeSyncPlugin extends Plugin {
 			return;
 		}
 
-		const syncStore = new VaultSyncStore(this.binaryStore, this.app.vault);
+		const syncStore = new VaultSyncStore(this.binaryStore, this.app.vault, (f) =>
+			this.app.fileManager.trashFile(f),
+		);
 		const factory: PeerConnectionFactory = {
 			connect: async (url) => {
 				const { WebSocketConnectionFactory } = await import("./sync/WebSocketTransport");
