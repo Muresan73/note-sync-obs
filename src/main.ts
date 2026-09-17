@@ -1,4 +1,4 @@
-import { Plugin, Notice, normalizePath, TFile, type PluginManifest, type App } from "obsidian";
+import { Plugin, Notice, normalizePath, TFile, TAbstractFile, type PluginManifest, type App } from "obsidian";
 import { VaultBinaryStore } from "./persistence/VaultBinaryStore";
 import {
 	AutomergeDocumentStore,
@@ -14,7 +14,9 @@ import {
 	SyncEngine,
 	startBackgroundSync,
 	initSyncAutomerge,
+	applyEdit,
 	decodeNoteDoc,
+	encodeNoteDoc,
 	type SyncStore,
 	type SyncStatus,
 	type PeerConnectionFactory,
@@ -24,13 +26,28 @@ const DOC_DIR = ".automerge-sync";
 const DOC_EXTENSION = ".amrg"; // automerge-encoded note docs, distinct from source notes
 
 /**
- * SyncStore over the Obsidian vault: tracks all markdown notes, storing each
- * note's automerge doc under .automerge-sync/<hashed path>.amrg.
+ * SyncStore over the Obsidian vault — the bridge between note text and
+ * Automerge documents:
+ *
+ * - `listFiles`: all markdown notes in the vault
+ * - `readDoc`: load the note's automerge doc, first importing the CURRENT
+ *   markdown text if it changed on disk since the last sync (mtime check)
+ * - `writeDoc`: persist the merged doc AND write its content back to the
+ *   .md file if the merged text differs from disk
+ *
+ * This is what makes sync actually move note content between vaults.
  */
 export class VaultSyncStore implements SyncStore {
-	constructor(private readonly adapter: VaultBinaryStore, private readonly vault: {
-		getMarkdownFiles(): TFile[];
-	}) {}
+	constructor(
+		private readonly adapter: VaultBinaryStore,
+		private readonly vault: {
+			getMarkdownFiles(): TFile[];
+			getAbstractFileByPath(path: string): TAbstractFile | null;
+			read(file: TFile): Promise<string>;
+			modify(file: TFile, data: string): Promise<void>;
+			create(path: string, data: string): Promise<TFile>;
+		},
+	) {}
 
 	private docPathFor(notePath: string): string {
 		// Flatten the path so no directory structure is needed; encode to keep
@@ -45,12 +62,66 @@ export class VaultSyncStore implements SyncStore {
 
 	async readDoc(notePath: string): Promise<Uint8Array | null> {
 		const p = this.docPathFor(notePath);
-		if (!(await this.adapter.exists(p))) return null;
-		return this.adapter.read(p);
+		const abstract = this.vault.getAbstractFileByPath(notePath);
+		const file: TFile | null = abstract && "stat" in abstract ? (abstract as TFile) : null;
+
+		if (!(await this.adapter.exists(p))) {
+			// No doc yet: seed it FROM the markdown text (with mtime) so the
+			// first sync round carries the note's content. Without this, a
+			// brand-new note syncs as an empty doc and its text never travels.
+			if (file) {
+				const text = await this.vault.read(file);
+				return encodeNoteDoc({
+					path: notePath,
+					content: text,
+					updatedAt: file.stat.mtime,
+				});
+			}
+			return null;
+		}
+		const bytes = await this.adapter.read(p);
+
+		// Import: if the .md file changed since we last stored the doc,
+		// fold the current text into the doc as a new change.
+		try {
+			const doc = decodeNoteDoc(bytes);
+			const abstract = this.vault.getAbstractFileByPath(notePath);
+			const file: TFile | null = abstract && "stat" in abstract ? (abstract as TFile) : null;
+			if (file && typeof file.stat.mtime === "number") {
+				// doc.updatedAt holds the mtime of the last imported text.
+				if (file.stat.mtime > doc.updatedAt) {
+					const text = await this.vault.read(file);
+					const mtime = file.stat.mtime;
+					return applyEdit(bytes, (d) => {
+						d.content = text;
+						d.updatedAt = mtime;
+					});
+				}
+			}
+		} catch {
+			// Corrupt doc — fall through and return raw bytes; sync will surface
+			// the error if the bytes are unreadable by automerge itself.
+		}
+		return bytes;
 	}
 
 	async writeDoc(notePath: string, bytes: Uint8Array): Promise<void> {
 		await this.adapter.write(this.docPathFor(notePath), bytes);
+
+		// Export: if the merged doc's content differs from the .md on disk,
+		// write it back so sync results are visible in the vault.
+		const abstract = this.vault.getAbstractFileByPath(notePath);
+		const doc = decodeNoteDoc(bytes);
+		if (abstract && "stat" in abstract) {
+			const file = abstract as TFile;
+			const diskText = await this.vault.read(file);
+			if (diskText !== doc.content) {
+				await this.vault.modify(file, doc.content);
+			}
+		} else if (doc.content) {
+			// Note exists on the remote but not here — create it.
+			await this.vault.create(normalizePath(notePath), doc.content);
+		}
 	}
 }
 
