@@ -30,6 +30,22 @@ The Automerge layer never imports Obsidian — it takes a `BinaryStore` interfac
 | Create or update Automerge sample document | Creates `.automerge-sync/sample.automerge` or updates it through the service |
 | Show Automerge sample document | Modal with escaped document content |
 | Show raw Automerge byte length | Diagnostic: byte size of the persisted file |
+| Sync now | Runs one sync round immediately against the configured server |
+
+## Background sync
+
+When enabled in settings, the plugin runs a background loop:
+
+- Every note in the vault gets its own Automerge document; encoded copies live under `.automerge-sync/<path>.amrg`.
+- On each interval (default 30 s) it connects to the configured WebSocket URL, exchanges file lists, and runs the Automerge sync protocol per file in both directions. Files present on only one side are created on the other; concurrent edits to different fields CRDT-merge.
+- **Status bar**: bottom-right indicator — `AM: off` (disabled) / `AM: connecting…` / `AM: syncing…` / `AM: ok N files (Xs ago)` / `AM: error` (hover for the message).
+- **Settings tab** (Settings → Automerge Sync): enable toggle, server URL (`ws://…`), interval in seconds.
+
+⚠️ Concurrency semantics: concurrent edits to the *same string field* resolve last-writer-wins (Automerge LWW). True character-level text merging requires `spliceText` document modeling — planned for the note-sync milestone.
+
+### Server side
+
+The engine's protocol is symmetric: `handlePeerSession(transport, store)` runs the peer side (file-list, begin, sync, done frames — see `src/sync/SyncEngine.ts`). A relay server that keeps doc copies implements exactly that against a WebSocket; two plugin instances talking directly also work, which is what the test suite simulates (`tests/syncEngine.test.ts`: loopback transports, two in-memory vaults, converge + bidirectional + no-op second round + error-state cases).
 
 ## Development
 

@@ -31,12 +31,23 @@ export class Plugin {
 		this.commands[cmd.id] = cmd;
 		return cmd;
 	}
+	addStatusBarItem(): HTMLElement {
+		return document.createElement("span");
+	}
+	addSettingTab(): void {}
 	registerEvent(): void {}
 	registerDomEvent(): void {}
 	async loadData(): Promise<unknown> {
 		return null;
 	}
 	async saveData(): Promise<void> {}
+}
+
+export class PluginSettingTab {
+	containerEl: HTMLElement = document.createElement("div");
+	constructor(public app?: unknown, public plugin?: unknown) {}
+	display(): void {}
+	hide(): void {}
 }
 
 export const normalizePath = (p: string): string => p;
