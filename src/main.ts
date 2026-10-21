@@ -1,334 +1,170 @@
-import { Plugin, Notice, normalizePath, TFile, TAbstractFile, type PluginManifest, type App } from "obsidian";
-import { VaultBinaryStore } from "./persistence/VaultBinaryStore";
-import {
-	AutomergeDocumentStore,
-	AutomergeError,
-	initAutomerge,
-	type SampleDocument,
-} from "./automerge/AutomergeDocumentStore";
-import { createOrUpdateSample, SAMPLE_PATH } from "./commands/sampleDocument";
-import { DocumentModal } from "./ui/DocumentView";
-import { SyncSettingTab, DEFAULT_SETTINGS, type SyncSettings } from "./ui/SyncSettingTab";
-import { StatusBarIndicator } from "./ui/StatusBarIndicator";
-import {
-	SyncEngine,
-	startBackgroundSync,
-	initSyncAutomerge,
-	applyEdit,
-	decodeNoteDoc,
-	encodeNoteDoc,
-	type SyncStore,
-	type SyncStatus,
-	type PeerConnectionFactory,
-} from "./sync/SyncEngine";
-
-const DOC_DIR = ".automerge-sync";
-const DOC_EXTENSION = ".amrg"; // automerge-encoded note docs, distinct from source notes
-
 /**
- * SyncStore over the Obsidian vault — the bridge between note text and
- * Automerge documents:
- *
- * - `listFiles`: all markdown notes in the vault
- * - `readDoc`: load the note's automerge doc, first importing the CURRENT
- *   markdown text if it changed on disk since the last sync (mtime check)
- * - `writeDoc`: persist the merged doc AND write its content back to the
- *   .md file if the merged text differs from disk
- *
- * This is what makes sync actually move note content between vaults.
+ * Plugin entry point. Wires the vault to the sync loop and nothing else.
  */
-export class VaultSyncStore implements SyncStore {
-	constructor(
-		private readonly adapter: VaultBinaryStore,
-		private readonly vault: {
-			getMarkdownFiles(): TFile[];
-			getAbstractFileByPath(path: string): TAbstractFile | null;
-			read(file: TFile): Promise<string>;
-			modify(file: TFile, data: string): Promise<void>;
-			create(path: string, data: string): Promise<TFile>;
-		},
-		private readonly trash: (file: TAbstractFile) => Promise<void>,
-	) {}
+import {
+	Notice,
+	Plugin,
+	type App,
+	type PluginManifest,
+	type TAbstractFile,
+} from 'obsidian';
+import { initAutomerge, syncRound, wire, type Round } from './sync';
+import { vaultStore, ensureDocDir, type VaultIO } from './vault';
+import { listen, type Listener } from './server';
+import { Settings, type Config } from './settings';
 
-	private docPathFor(notePath: string): string {
-		// Flatten the path so no directory structure is needed; encode to keep
-		// it a safe single filename.
-		const safe = notePath.replace(/[^a-zA-Z0-9._-]/g, "_");
-		return `${DOC_DIR}/${safe}${DOC_EXTENSION}`;
-	}
+const DEFAULT: Config = {
+	sync: true,
+	intervalMs: 30_000,
+	listen: false,
+	port: 8521,
+	peers: [],
+};
 
-	// Track notes whose .md file vanished but whose doc still exists — they
-	// get a tombstone doc (deleted flag) so the deletion propagates to other
-	// replicas instead of the file resurrecting on the next sync.
-	private deletedPaths: Set<string> | null = null;
-
-	/**
-	 * Find .amrg docs whose note no longer exists in the vault. The note path
-	 * is read from the doc payload (the flattened filename is lossy).
-	 * Cached per sync round (listFiles is called once per round).
-	 */
-	private async deletedNotes(): Promise<Set<string>> {
-		if (this.deletedPaths) return this.deletedPaths;
-		const deleted = new Set<string>();
-		for (const p of await this.adapter.listDir(DOC_DIR)) {
-			if (!p.endsWith(DOC_EXTENSION)) continue;
-			try {
-				const doc = decodeNoteDoc(await this.adapter.read(p));
-				if (!doc.deleted && !this.vault.getAbstractFileByPath(doc.path)) {
-					deleted.add(doc.path);
-				}
-			} catch {
-				// Unreadable blob — leave it alone.
-			}
-		}
-		this.deletedPaths = deleted;
-		return deleted;
-	}
-
-	async listFiles(): Promise<string[]> {
-		const deleted = await this.deletedNotes();
-		// Include tombstone candidates so the engine syncs their (marked)
-		// docs to peers, then clear the cache for the next round.
-		const paths = [...this.vault.getMarkdownFiles().map((f) => f.path), ...deleted];
-		this.deletedPaths = null;
-		return paths;
-	}
-
-	async readDoc(notePath: string): Promise<Uint8Array | null> {
-		const p = this.docPathFor(notePath);
-		const abstract = this.vault.getAbstractFileByPath(notePath);
-		const file: TFile | null = abstract && "stat" in abstract ? (abstract as TFile) : null;
-
-		if (!(await this.adapter.exists(p))) {
-			// No doc yet: seed it FROM the markdown text (with mtime) so the
-			// first sync round carries the note's content. Without this, a
-			// brand-new note syncs as an empty doc and its text never travels.
-			if (file) {
-				const text = await this.vault.read(file);
-				return encodeNoteDoc({
-					path: notePath,
-					content: text,
-					updatedAt: file.stat.mtime,
-					deleted: false,
-				});
-			}
-			return null;
-		}
-		const bytes = await this.adapter.read(p);
-
-		// Deletion: the .md vanished but the doc still exists — mark it.
-		// The tombstone then propagates to peers through normal sync.
-		if (!file) {
-			return applyEdit(bytes, (d) => {
-				d.deleted = true;
-				d.content = "";
-			});
-		}
-
-		// Import: if the .md file changed since we last stored the doc,
-		// fold the current text into the doc as a new change.
-		try {
-			const doc = decodeNoteDoc(bytes);
-			const abstract = this.vault.getAbstractFileByPath(notePath);
-			const file: TFile | null = abstract && "stat" in abstract ? (abstract as TFile) : null;
-			if (file && typeof file.stat.mtime === "number") {
-				// doc.updatedAt holds the mtime of the last imported text.
-				if (file.stat.mtime > doc.updatedAt) {
-					const text = await this.vault.read(file);
-					const mtime = file.stat.mtime;
-					return applyEdit(bytes, (d) => {
-						d.content = text;
-						d.updatedAt = mtime;
-					});
-				}
-			}
-		} catch {
-			// Corrupt doc — fall through and return raw bytes; sync will surface
-			// the error if the bytes are unreadable by automerge itself.
-		}
-		return bytes;
-	}
-
-	async writeDoc(notePath: string, bytes: Uint8Array): Promise<void> {
-		await this.adapter.write(this.docPathFor(notePath), bytes);
-
-		// Export: honor the tombstone first — a deletion that arrived via sync
-		// removes the local file; content export only applies to live notes.
-		const abstract = this.vault.getAbstractFileByPath(notePath);
-		const doc = decodeNoteDoc(bytes);
-		if (doc.deleted) {
-			if (abstract && "stat" in abstract) {
-				await this.trash(abstract);
-			}
-			return;
-		}
-		if (abstract && "stat" in abstract) {
-			const file = abstract as TFile;
-			const diskText = await this.vault.read(file);
-			if (diskText !== doc.content) {
-				await this.vault.modify(file, doc.content);
-			}
-		} else if (doc.content) {
-			// Note exists on the remote but not here — create it.
-			await this.vault.create(normalizePath(notePath), doc.content);
-		}
-	}
+/** Merge saved settings over the defaults, ignoring anything malformed. A
+ *  hand-edited or truncated data.json must not be able to break the plugin. */
+function loadConfig(saved: unknown): Config {
+	const raw = (saved ?? {}) as Partial<Config>;
+	const ms = raw.intervalMs;
+	const port = raw.port;
+	return {
+		sync: typeof raw.sync === 'boolean' ? raw.sync : DEFAULT.sync,
+		intervalMs:
+			typeof ms === 'number' && ms >= 5_000 ? ms : DEFAULT.intervalMs,
+		listen: typeof raw.listen === 'boolean' ? raw.listen : DEFAULT.listen,
+		port:
+			typeof port === 'number' && port > 0 && port < 65_536
+				? Math.floor(port)
+				: DEFAULT.port,
+		peers: Array.isArray(raw.peers)
+			? raw.peers.filter((p) => typeof p === 'string' && p)
+			: [],
+	};
 }
 
 export default class AutomergeSyncPlugin extends Plugin {
-	settings: SyncSettings = { ...DEFAULT_SETTINGS };
-	private binaryStore!: VaultBinaryStore;
-	private store!: AutomergeDocumentStore;
-	private syncEngine: SyncEngine | null = null;
-	private cancelSync: (() => void) | null = null;
-	private statusBar!: StatusBarIndicator;
+	config: Config = { ...DEFAULT };
+	private store = vaultStore(this.bridge());
+	private listener: Listener | null = null;
+	private timer: ReturnType<typeof setTimeout> | null = null;
+	private statusBar: HTMLElement | null = null;
+	private lastPaint = '';
 
 	constructor(app: App, manifest: PluginManifest) {
 		super(app, manifest);
 	}
 
-	/** Exposed for tests. */
-	get engine(): SyncEngine | null {
-		return this.syncEngine;
+	/** The vault, plus trashing. Obsidian has no vault-level delete; routing
+	 *  through fileManager respects the user's trash settings. */
+	private bridge(): VaultIO {
+		const app = this.app;
+		return Object.assign(Object.create(app.vault), {
+			trash: (file: TAbstractFile) => app.fileManager.trashFile(file),
+		});
 	}
 
 	async onload(): Promise<void> {
 		await initAutomerge();
-		await initSyncAutomerge();
-		await this.loadSettings();
+		this.config = loadConfig(await this.loadData());
+		await ensureDocDir(this.app.vault.adapter);
 
-		this.binaryStore = new VaultBinaryStore(this.app.vault.adapter);
-		await this.binaryStore.mkdirp(DOC_DIR);
-		this.store = new AutomergeDocumentStore(this.binaryStore, SAMPLE_PATH);
+		this.addSettingTab(new Settings(this.app, this));
+		this.addCommand({
+			id: 'sync-now',
+			name: 'Sync now',
+			callback: () => void this.syncNow(),
+		});
 
-		this.statusBar = new StatusBarIndicator(() =>
-			this.addStatusBarItem(),
-		);
-		this.statusBar.attach();
-
-		this.addSettingTab(new SyncSettingTab(this.app, this));
-
-		this.registerCommands();
-		await this.restartSync();
+		this.statusBar = this.addStatusBarItem();
+		void this.restart();
 	}
 
 	onunload(): void {
-		this.cancelSync?.();
-		this.statusBar.detach();
+		if (this.timer) clearTimeout(this.timer);
+		this.timer = null;
+		void this.listener?.close();
+		this.listener = null;
 	}
 
-	async loadSettings(): Promise<void> {
-		const data = (await this.loadData()) as Partial<SyncSettings> | null;
-		this.settings = { ...DEFAULT_SETTINGS, ...(data ?? {}) };
+	/** Sync every peer, then schedule the next round. Backoff doubles on
+	 *  failure so an unplugged peer is retried politely, not in a hot loop. */
+	// 	private async run(): Promise<void> {
+	// 		if (!this.config.sync) {
+	// 			this.editStatusBarText('automerge: off');
+	// 			return;
+	// 		}
+	//
+	// 		const rounds = await Promise.all(
+	// 			this.config.peers.map((address) => this.syncOne(address)),
+	// 		);
+	// 		const failed = rounds.filter((r) => !r.ok);
+	// 		const files = rounds.reduce((n, r) => n + r.files, 0);
+	//
+	// 		this.editStatusBarText(
+	// 			failed.length
+	// 				? `automerge: ${failed.length}/${rounds.length} peers failed — ${failed[0].error}`
+	// 				: `automerge: ${files} files`,
+	// 		);
+	//
+	// 		const delay = failed.length
+	// 			? Math.min(this.config.intervalMs * 2, 300_000)
+	// 			: this.config.intervalMs;
+	// 		this.timer = setTimeout(() => void this.run(), delay);
+	// 	}
+
+	/** Open a socket to one peer and exchange documents over it. */
+	private syncOne(address: string): Promise<unknown> {
+		return new Promise((resolve, reject) => {
+			const ws = new WebSocket(address);
+
+			ws.onopen = () => new Notice('happy its connected');
+
+			ws.binaryType = 'arraybuffer';
+			ws.onmessage = (e: Event) => {
+				const message = new Uint8Array((e as MessageEvent).data);
+			};
+
+			ws.onclose = resolve;
+			ws.onerror = reject;
+
+			// const round = await syncRound(this.store, ws);
+		});
 	}
 
-	async saveSettings(): Promise<void> {
-		await this.saveData(this.settings);
-	}
-
-	/** (Re)start or stop background sync based on current settings. */
-	async restartSync(): Promise<void> {
-		this.cancelSync?.();
-		this.cancelSync = null;
-		this.syncEngine = null;
-
-		if (!this.settings.syncEnabled) {
-			this.statusBar.update({
-				state: "offline",
-				lastSyncMs: null,
-				filesSynced: 0,
-				error: null,
-				peers: 0,
-			});
+	async syncNow(): Promise<void> {
+		if (!this.config.peers.length) {
+			new Notice(
+				'No peers configured. Add one in Settings → Automerge Sync.',
+			);
 			return;
 		}
-
-		const syncStore = new VaultSyncStore(this.binaryStore, this.app.vault, (f) =>
-			this.app.fileManager.trashFile(f),
+		const rounds = await Promise.all(
+			this.config.peers.map(async (a) => this.syncOne(a)),
 		);
-		const factory: PeerConnectionFactory = {
-			connect: async (url) => {
-				const { WebSocketConnectionFactory } = await import("./sync/WebSocketTransport");
-				return new WebSocketConnectionFactory((u) => new WebSocket(u)).connect(url);
-			},
-		};
-		const engine = new SyncEngine(syncStore, factory, this.settings.serverUrl);
-		engine.onStatus((s) => this.statusBar.update(s));
-		this.syncEngine = engine;
-		this.cancelSync = startBackgroundSync(
-			engine,
-			this.settings.syncIntervalMs,
-			(e) => console.error("[automerge-sync] background sync error:", e),
+		const files = rounds.reduce((n, r) => n + r.files, 0);
+		const failed = rounds.filter((r) => !r.ok);
+		new Notice(
+			failed.length
+				? `Synced ${files} files; ${failed.length} peer(s) failed: ${failed[0].error}`
+				: `Synced ${files} files with ${this.config.peers.length} peer(s).`,
 		);
 	}
 
-	private registerCommands(): void {
-		this.addCommand({
-			id: "create-or-update-sample",
-			name: "Create or update Automerge sample document",
-			callback: async () => {
-				try {
-					const doc = await createOrUpdateSample(this.store, this);
-					new Notice(`Automerge sample document saved (${doc.tags.length} tags).`);
-				} catch (e) {
-					this.reportFailure("Failed to create/update sample document", e);
-				}
-			},
-		});
-
-		this.addCommand({
-			id: "show-sample",
-			name: "Show Automerge sample document",
-			callback: async () => {
-				try {
-					const doc: SampleDocument = await this.store.load();
-					new DocumentModal(this.app, doc).open();
-				} catch (e) {
-					this.reportFailure("Failed to load sample document", e);
-				}
-			},
-		});
-
-		this.addCommand({
-			id: "inspect-bytes",
-			name: "Show raw Automerge byte length",
-			callback: async () => {
-				try {
-					const bytes = await this.app.vault.adapter.readBinary(SAMPLE_PATH);
-					new Notice(`sample.automerge is ${bytes.byteLength} bytes.`);
-				} catch (e) {
-					this.reportFailure("Failed to read document bytes", e);
-				}
-			},
-		});
-
-		this.addCommand({
-			id: "sync-now",
-			name: "Sync now",
-			callback: async () => {
-				if (!this.syncEngine) {
-					new Notice("Sync is disabled in settings.");
-					return;
-				}
-				const status: SyncStatus = await this.syncEngine.syncOnce();
-				if (status.state === "synced") {
-					new Notice(`Synced ${status.filesSynced} files.`);
-				} else {
-					new Notice(`Sync failed: ${status.error ?? status.state}`);
-				}
-			},
-		});
+	/** Apply settings: restart the listener and the sync loop. */
+	async restart(): Promise<void> {
+		// TODO nothing to restart yet but maybe later
 	}
 
-	private reportFailure(message: string, error: unknown): void {
-		new Notice(`${message}: ${error instanceof Error ? error.message : String(error)}`);
-		if (error instanceof AutomergeError && error.cause) {
-			console.error("[automerge-sync] underlying cause:", error.cause);
-		} else {
-			console.error("[automerge-sync]", error);
-		}
+	/**
+	 * **Update the Status Bar Text**
+	 *
+	 * > These lines are needed to avoid redundant DOM updates
+	 * > when the text hasn't changed, and to keep the last value
+	 * > in sync so the check works on the next call.
+	 */
+	private editStatusBarText(text: string): void {
+		if (text === this.lastPaint) return;
+		this.lastPaint = text;
+		this.statusBar?.setText(text);
 	}
 }
-
-// Re-export for tests convenience.
-export { decodeNoteDoc, normalizePath };

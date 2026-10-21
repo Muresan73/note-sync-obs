@@ -1,93 +1,104 @@
 # automerge-sync
 
-Local-first Automerge document sync for Obsidian (milestone 1: local only, no networking).
+Take notes in Obsidian. They show up on your other devices. There's a copy on
+your server. Nothing merges by hand, because Automerge already solves that
+problem better than I could write it in a weekend.
 
-## Architecture
+The idea: **a note is a CRDT document**. Your laptop edits it, your phone edits
+it, the server keeps it. Automerge merges them. That's the whole product.
 
-```
-src/main.ts                    Plugin class: init, commands, error reporting
-src/automerge/
-  AutomergeDocumentStore.ts    Pure Automerge layer: create/change/merge/encode/decode + store
-  automergeTypes.ts            Re-exported Automerge types
-src/persistence/
-  VaultBinaryStore.ts          Binary I/O over Vault adapter (tmp-write → verify → final)
-src/commands/sampleDocument.ts Create-or-update sample logic
-src/ui/DocumentView.ts         Modal display (escaped text)
-```
+## How it works
 
-The Automerge layer never imports Obsidian — it takes a `BinaryStore` interface, so it's fully testable in Node.
+Your vault dials each peer on a timer. Each round:
 
-**WASM strategy:** `@automerge/automerge/slim` + `@automerge/automerge/automerge.wasm.base64`, initialized exactly once via `initializeBase64Wasm()` in `onload()`. The WASM binary is embedded as base64 inside `main.js` (pure JS, ~4.8 MB) — no `.wasm` asset to ship, no `fetch`, no filesystem access. This is Automerge's documented path for JS-only environments (see [library initialization docs](https://automerge.org/docs/reference/library-initialization/)).
+1. Ask the peer for its file list.
+2. For every path in either vault, exchange Automerge sync messages until both
+   sides agree.
+3. Write the merged result back to disk.
 
-**Atomicity:** the Vault/DataAdapter API has no atomic rename, so writes go to `<path>.tmp`, are read back and byte-verified, then copied to the target. A failure before the final write leaves the old document intact. The verify→final window cannot be closed with the public API.
+Notes are markdown. Attachments are everything else, base64 inside their own
+document, only re-sent when their content hash changes. A deleted file becomes a
+tombstone so it doesn't come back next round.
 
-**Actor IDs:** each Automerge replica has a random actor ID. With a single vault file there is effectively one replica; actor IDs only matter once multiple devices sync (milestone 2).
+Documents live in `.automerge-sync/` beside your notes. They're an
+implementation detail — Obsidian doesn't index that folder.
 
-## Commands
+## Settings
 
-| Command | What it does |
-|---|---|
-| Create or update Automerge sample document | Creates `.automerge-sync/sample.automerge` or updates it through the service |
-| Show Automerge sample document | Modal with escaped document content |
-| Show raw Automerge byte length | Diagnostic: byte size of the persisted file |
-| Sync now | Runs one sync round immediately against the configured server |
+Settings → Automerge Sync.
 
-## Background sync
+| Setting | Default | Meaning |
+|---|---|---|
+| Sync automatically | on | Off means only the Sync now command syncs. |
+| Sync every | 30 | Seconds between rounds. |
+| Accept connections | off | Serve other vaults on this machine. |
+| Port | 8521 | The listening port. |
+| Peers | empty | Addresses of the other vaults, e.g. `ws://192.168.1.10:8521`. |
 
-When enabled in settings, the plugin runs a background loop:
+Every vault has the same settings. There's no "server" mode — the machine you
+leave running is just the one with *Accept connections* turned on.
 
-- Every note in the vault gets its own Automerge document; encoded copies live under `.automerge-sync/<path>.amrg`.
-- **The vault bridge (`VaultSyncStore` in `src/main.ts`) is what moves note text:** before each sync round it imports the current markdown text into the note's doc (seeded from the file on first sync; mtime-guarded afterwards), and after syncing it writes merged content back to the `.md` — updating existing notes and creating files that only exist on the other side. Changes sync as visible vault edits, not just `.amrg` blobs.
-- **Deletion & moves are tombstoned:** when a note's `.md` is deleted (or moved — a move is create-new + delete-old), its doc is marked `deleted: true` and that flag propagates through sync like any change. Other vaults honor it by trashing the local file, so deletions sync correctly instead of the note resurrecting.
-- On each interval (default 30 s) it connects to the configured WebSocket URL, exchanges file lists, and runs the Automerge sync protocol per file in both directions. Concurrent edits to different fields CRDT-merge.
-- **Status bar**: bottom-right indicator — `AM: off` (disabled) / `AM: connecting…` / `AM: syncing…` / `AM: ok N files (Xs ago)` / `AM: error` (hover for the message).
-- **Settings tab** (Settings → Automerge Sync): enable toggle, server URL (`ws://…`), interval in seconds.
+Two commands: **Sync now** (all peers, once). The status bar shows
+`automerge: 12 files`, or the first error if a peer failed.
 
-⚠️ Concurrency semantics: concurrent edits to the *same string field* resolve last-writer-wins (Automerge LWW). True character-level text merging requires `spliceText` document modeling — planned for the note-sync milestone.
+## Security, honestly
 
-### Server side
+- **Nothing is encrypted.** Plain `ws://`. This is a LAN tool and I assume you
+  trust your own network.
+- **No peer authentication.** Anything that can reach the port can read and
+  write your notes. Don't expose this to the internet, and don't run it on a
+  network you don't control.
+- I originally planned self-signed certs and fingerprint pinning, the way SSH
+  does it. That needs an X.509 generator, and the only ones available pull in
+  ~8 MB of `pkijs` and `@peculiar/x509` to make one certificate. Not worth it
+  for a note sync on a home network. If you need transport security, put a
+  reverse proxy in front and give the plugin `wss://` addresses — the protocol
+  already works over TLS unchanged, since it's just WebSockets.
 
-The engine's protocol is symmetric: `handlePeerSession(transport, store)` runs the peer side (file-list, begin, sync, done frames — see `src/sync/SyncEngine.ts`). A relay server that keeps doc copies implements exactly that against a WebSocket; two plugin instances talking directly also work, which is what the test suite simulates (`tests/syncEngine.test.ts`: loopback transports, two in-memory vaults, converge + bidirectional + no-op second round + error-state cases).
+## Known limitations
 
-### Relay hub (recommended)
-
-`relay.mjs` is a **hub**: it stores documents in memory and runs the peer side of the protocol (`handlePeerSession`) for every connection. Vaults can connect independently — no pairing, no need to be online simultaneously.
-
-```sh
-npm run build:relay        # bundle relay.mjs (or: node scripts/build-relay.mjs)
-node relay.mjs 8080        # → "Automerge relay hub listening on ws://0.0.0.0:8080"
-```
-
-Point **every vault's** Server URL at `ws://localhost:8080`. Each vault syncs with the hub on its own interval; the hub merges everything (CRDT) and serves the merged state to the others. The hub's store is in-memory; run it persistently for a long-lived sync point.
+- **Concurrent edits to the same paragraph resolve last-writer-wins.** That's
+  Automerge's semantics for a string field. Character-level merging means
+  storing note bodies as Automerge text sequences instead of strings — a
+  one-line change in `Doc`, and the right eventual call, but not free.
+- **Sync is per-round.** Open, exchange, close. Nothing is persistent between
+  syncs, so the status bar describes the last round, not a live connection.
+- **Attachments are base64 in the document.** A 4 MB image becomes a 5.3 MB
+  string. It works and it round-trips exactly; it is not efficient.
+- **Renames are create-new + delete-old.** Both propagate, but Obsidian's own
+  rename events don't participate — we compare against the filesystem.
 
 ## Development
 
-Requires Node ≥ 20. Note: if your shell sets `NODE_ENV=production`, npm skips devDependencies — use `env -u NODE_ENV npm install --include=dev` or unset it.
+Node ≥ 20. If your shell has `NODE_ENV=production` set, npm quietly skips
+devDependencies — use `env -u NODE_ENV npm install --include=dev`.
 
 ```sh
-npm install                 # install deps
-npm test                    # vitest (16 tests: automerge, persistence, plugin boundary)
-npm run build               # tsc --noEmit + esbuild production + smoke test
-npm run check               # test + build
-npm run dev                 # esbuild watch
+npm run check   # tests + typecheck + build + smoke test
+npm test
+npm run dev
 ```
 
-## Install into a dev vault
+`main.js` is self-contained — the Automerge WASM and `ws` are both bundled in.
+Two files to copy, nothing else:
 
-1. Create/choose a **development vault** (never production).
-2. Copy `main.js`, `manifest.json` into `<vault>/.obsidian/plugins/automerge-sync/`.
-3. Enable "Automerge Sync" in Settings → Community plugins (disable restricted mode first).
-4. Run the commands from the command palette.
+```sh
+npm run build
+cp main.js manifest.json <dev-vault>/.obsidian/plugins/automerge-sync/
+```
+
+## Layout
+
+```
+src/sync.ts      the protocol. pure — no Obsidian, no sockets
+src/vault.ts     the only file that knows Obsidian exists
+src/server.ts    the listener
+src/settings.ts  the settings tab
+src/main.ts      wiring
+```
 
 ## References
 
-- Automerge library initialization (slim/base64): https://automerge.org/docs/reference/library-initialization/
-- `@automerge/automerge` npm (3.4.1): https://www.npmjs.com/package/@automerge/automerge
-- Obsidian sample plugin: https://github.com/obsidianmd/obsidian-sample-plugin
+- Automerge library initialization: https://automerge.org/docs/reference/library-initialization/
+- `@automerge/automerge` 3.4.1: https://www.npmjs.com/package/@automerge/automerge
 - Obsidian plugin docs: https://docs.obsidian.md/Plugins
-
-## Known limitations / next steps
-
-- No multi-device sync yet. Next: `@automerge/automerge-repo` with a storage adapter over `VaultBinaryStore` and a pluggable network adapter (e.g. syncserver or WebRTC); per-document actor IDs; Markdown sync is a separate concern and intentionally not conflated with Automerge document sync.
-- No settings tab yet (path is fixed at `.automerge-sync/sample.automerge`).
-- Atomic replacement is best-effort (see above).

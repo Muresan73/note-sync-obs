@@ -1,7 +1,21 @@
 /**
  * Minimal Obsidian runtime stub for tests. The real `obsidian` npm package is
  * types-only (no JS entry), so vitest aliases "obsidian" to this file.
+ *
+ * Only what the plugin touches. TFile must be a real class because the vault
+ * bridge uses `instanceof TFile` to tell files from folders.
  */
+
+export class TAbstractFile {
+	path = "";
+	name = "";
+}
+
+export class TFile extends TAbstractFile {
+	extension = "";
+	stat = { mtime: 0, ctime: 0, size: 0 };
+}
+
 export class Notice {
 	static lastMessages: string[] = [];
 	public message: string;
@@ -10,13 +24,6 @@ export class Notice {
 		Notice.lastMessages.push(message);
 	}
 	hide(): void {}
-}
-
-export class Modal {
-	contentEl: HTMLElement = document.createElement("div");
-	constructor(public app?: unknown) {}
-	open(): void {}
-	close(): void {}
 }
 
 export class Plugin {
@@ -32,7 +39,11 @@ export class Plugin {
 		return cmd;
 	}
 	addStatusBarItem(): HTMLElement {
-		return document.createElement("span");
+		const el = document.createElement("span");
+		(el as unknown as { setText: (s: string) => void }).setText = (s: string) => {
+			el.textContent = s;
+		};
+		return el;
 	}
 	addSettingTab(): void {}
 	registerEvent(): void {}
@@ -43,9 +54,35 @@ export class Plugin {
 	async saveData(): Promise<void> {}
 }
 
+/** Enough of Setting for the settings tab to build rows without a real DOM. */
+export class Setting {
+	constructor(public containerEl?: unknown) {}
+	setName(): this {
+		return this;
+	}
+	setDesc(): this {
+		return this;
+	}
+	addToggle(): this {
+		return this;
+	}
+	addText(): this {
+		return this;
+	}
+	addButton(): this {
+		return this;
+	}
+	addExtraButton(): this {
+		return this;
+	}
+}
+
 export class PluginSettingTab {
 	containerEl: HTMLElement = document.createElement("div");
-	constructor(public app?: unknown, public plugin?: unknown) {}
+	constructor(
+		public app?: unknown,
+		public plugin?: unknown,
+	) {}
 	display(): void {}
 	hide(): void {}
 }

@@ -6,8 +6,8 @@
   "type": "module",
   "scripts": {
     "dev": "node esbuild.config.mjs --watch",
-    "build": "tsc --noEmit && node esbuild.config.mjs production && node tests/smoke.test.mjs",
-    "build:relay": "node scripts/build-relay.mjs",
+    "build:rust": "node scripts/build-rust.mjs",
+    "build": "npm run build:rust && tsc --noEmit && node esbuild.config.mjs production && node tests/smoke.test.mjs",
     "test": "vitest run",
     "test:watch": "vitest",
     "check": "npm run test && npm run build"

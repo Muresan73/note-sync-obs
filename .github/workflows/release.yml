@@ -26,17 +26,21 @@ jobs:
                   npm ci
                   npm run build
 
-            - name: Check for optional styles
-              id: styles
+            # main.js is self-contained: esbuild runs with platform:node, so ws
+            # bundles into it. No node_modules to ship — an installed plugin
+            # folder has none, and a runtime require of ws fails on load.
+            - name: Collect artifacts
               run: |
-                  [ -f styles.css ] && echo "exists=true" >> "$GITHUB_OUTPUT" || echo "exists=false" >> "$GITHUB_OUTPUT"
+                  mkdir -p dist
+                  cp main.js manifest.json dist/
+                  if [ -f styles.css ]; then cp styles.css dist/; fi
 
             - name: Attest build provenance
               uses: actions/attest@v4
               with:
                   subject-path: |
-                      main.js
-                      ${{ steps.styles.outputs.exists == 'true' && 'styles.css' || '' }}
+                      dist/main.js
+                      dist/manifest.json
 
             - name: Create release
               env:
@@ -47,4 +51,4 @@ jobs:
                   gh release create "$tag" \
                     --title="$tag" \
                     --draft \
-                    main.js manifest.json ${{ steps.styles.outputs.exists == 'true' && 'styles.css' || '' }}
+                    dist/main.js dist/manifest.json

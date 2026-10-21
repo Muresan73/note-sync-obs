@@ -21,22 +21,12 @@ if (typeof window !== 'undefined' && typeof window.Symbol === 'undefined') {
 	},
 	entryPoints: ["src/main.ts"],
 	bundle: true,
-	external: [
-		"obsidian",
-		"electron",
-		"@codemirror/autocomplete",
-		"@codemirror/collab",
-		"@codemirror/commands",
-		"@codemirror/language",
-		"@codemirror/lint",
-		"@codemirror/search",
-		"@codemirror/state",
-		"@codemirror/view",
-		"@lezer/common",
-		"@lezer/highlight",
-		"@lezer/lr",
-		...builtins,
-	],
+	// platform:node makes esbuild resolve `ws` to its CommonJS build rather than
+	// the browser stub, which has no WebSocketServer. With this set, ws bundles
+	// cleanly and the plugin becomes a single self-contained main.js — no
+	// node_modules to ship alongside it.
+	platform: "node",
+	external: ["obsidian", "electron", ...builtins],
 	format: "cjs",
 	target: "es2018",
 	logLevel: "info",
@@ -44,7 +34,6 @@ if (typeof window !== 'undefined' && typeof window.Symbol === 'undefined') {
 	treeShaking: true,
 	outfile: "main.js",
 	minify: prod,
-	// automerge /slim and the base64 blob are pure JS — no conditions needed.
 });
 
 if (prod) {
