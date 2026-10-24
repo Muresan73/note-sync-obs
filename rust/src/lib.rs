@@ -10,6 +10,10 @@ pub fn add(a: i32, b: i32) -> i32 {
     a + b
 }
 
+pub fn name(arg: Vec<u8>) {
+    todo!();
+}
+
 #[wasm_bindgen]
 pub struct Counter {
     value: i32,

@@ -9,6 +9,8 @@
 import * as Automerge from '@automerge/automerge/slim';
 import { automergeWasmBase64 } from '@automerge/automerge/automerge.wasm.base64';
 import type { SyncMessage, SyncState } from '@automerge/automerge';
+import {hello} from '../rust/pkg/note_sync_rust'
+import { log } from 'console';
 
 let started: Promise<void> | null = null;
 
@@ -101,6 +103,8 @@ async function recvFrame(peer: Wire, label: string): Promise<Frame> {
  */
 export async function syncRound(store: Store, peer: Wire): Promise<Round> {
 	let files = 0;
+	const greet = hello("alma")
+log(greet)
 	try {
 		await peer.send(encodeFrame({ t: 'files' }));
 		const reply = await recvFrame(
